@@ -63,7 +63,8 @@ fn clampTemperature(value: Value) f32 {
 }
 
 /// `gpa` is also used for scratch memory during predictions.
-pub fn load(gpa: Allocator, io: std.Io, path: []const u8) !Engine {
+/// Progress is reported under `progress`, one item per converted tensor.
+pub fn load(gpa: Allocator, io: std.Io, path: []const u8, progress: std.Progress.Node) !Engine {
     const arena = try gpa.create(std.heap.ArenaAllocator);
     errdefer gpa.destroy(arena);
     arena.* = .init(gpa);
@@ -97,6 +98,9 @@ pub fn load(gpa: Allocator, io: std.Io, path: []const u8) !Engine {
     defer file.close(io);
     var tensors: SafeTensors = try .open(gpa, io, file);
     defer tensors.deinit();
+    // Only an estimate, since a checkpoint can hold tensors that the model does not use.
+    const node = progress.start("Loading model", tensors.tensorCount());
+    defer node.end();
 
     // Allocate all weights in one block.
     // A growing arena rounds its blocks up to powers of two, which may not fit in WebAssembly's 4 GiB.
@@ -104,7 +108,7 @@ pub fn load(gpa: Allocator, io: std.Io, path: []const u8) !Engine {
     errdefer gpa.free(weights);
     var weight_buffer: std.heap.FixedBufferAllocator = .init(std.mem.sliceAsBytes(weights));
     const actions = if (config.act_costs) |costs| costs.map.count() + 1 else 2;
-    const model: Model = try .init(arena.allocator(), weight_buffer.allocator(), &tensors, encoder_json, config.head_layers, actions);
+    const model: Model = try .init(arena.allocator(), weight_buffer.allocator(), &tensors, encoder_json, config.head_layers, actions, node);
 
     return .{
         .gpa = gpa,
@@ -127,7 +131,8 @@ pub fn deinit(engine: *Engine) void {
 
 /// Returns the response to `request`, allocated in `arena`.
 /// The response borrows question IDs and criteria from `request`, which must outlive it.
-pub fn predict(engine: *const Engine, arena: Allocator, request: Value, raw: bool) !Value {
+/// Progress is reported under `progress`, one item per question.
+pub fn predict(engine: *const Engine, arena: Allocator, request: Value, raw: bool, progress: std.Progress.Node) !Value {
     if (request != .object) return error.InvalidRequest;
     const state = request.object.get("state") orelse return error.MissingState;
     const questions = request.object.get("questions") orelse return error.MissingQuestions;
@@ -137,6 +142,8 @@ pub fn predict(engine: *const Engine, arena: Allocator, request: Value, raw: boo
     defer state_arena.deinit();
     const state_tokens: sequence.State = try .encode(state_arena.allocator(), &engine.tokenizer, state);
 
+    const node = progress.start("Answering questions", questions.object.count());
+    defer node.end();
     var scratch: std.heap.ArenaAllocator = .init(engine.gpa);
     defer scratch.deinit();
     var answers: Value = .{ .object = .empty };
@@ -144,6 +151,7 @@ pub fn predict(engine: *const Engine, arena: Allocator, request: Value, raw: boo
         _ = scratch.reset(.retain_capacity);
         const reply = try engine.answer(arena, scratch.allocator(), state_tokens, question, raw);
         try answers.object.put(arena, id, reply);
+        node.completeOne();
     }
 
     var response: Value = .{ .object = .empty };

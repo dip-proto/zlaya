@@ -51,14 +51,25 @@ Questions are evaluated sequentially with the model loaded once.
 
 See [examples/triage.json](examples/triage.json) for all three types.
 
+```sh
+zig-out/bin/zlaya models/laya examples/triage.json
+```
+
 ### Output
 
 Results are written as JSON to stdout under `answers`.
 Choice and score answers include their full probability distribution.
+
 Every answer includes confidence and the learned action probability.
 
 Numbers are rounded to four decimal places, following the current Python implementation.
+
 Temperature calibration uses the checkpoint's option-count buckets and the upstream clamp to `[0.5, 5]`.
+
+When stderr is a terminal, zlaya shows progress there while loading the model and answering questions.
+
+Native builds draw a live counter, and WebAssembly builds print one line per phase.
+Redirecting stderr hides it, but errors are still reported there.
 
 ### Context limits and debugging
 
@@ -74,6 +85,7 @@ Use `--raw` as the final argument to include token IDs, marker positions, option
 
 On macOS, the default build uses Apple's Accelerate CPU BLAS for matrix multiplication.
 The rest of the model executes in Zig.
+
 On other systems, the default uses the portable Zig matrix kernels and libc's error function.
 
 You can select the backend explicitly with `-Dblas`:
@@ -84,6 +96,7 @@ zig build -Doptimize=ReleaseFast -Dblas=system
 ```
 
 `none` uses the portable Zig kernels.
+
 `system` links Accelerate on macOS, and elsewhere a system library exposing `cblas_sgemm` as `libblas`.
 A third value, `openblas`, compiles OpenBLAS from source; it is the default for WebAssembly and only supported there.
 
@@ -135,18 +148,22 @@ Import the `zlaya` module exported by `build.zig`.
 
 ### Engine lifecycle
 
-`Engine.load(gpa, io, model_directory)` loads reusable weights and tokenization data; call `deinit()` when finished.
+`Engine.load(gpa, io, model_directory, progress)` loads reusable weights and tokenization data; call `deinit()` when finished.
 The same allocator provides scratch memory for each prediction.
 
-`engine.predict(arena, request_value, false)` returns a `std.json.Value` response allocated in `arena`.
+`engine.predict(arena, request_value, false, progress)` returns a `std.json.Value` response allocated in `arena`.
 Use a fresh arena for each request and free it after consuming the response.
 The response borrows question IDs and criteria from the request, so keep the request alive as long as the response.
+
+Both functions report to a `std.Progress.Node`, with one item per converted tensor or answered question.
+Pass `.none` if you don't need progress.
 
 ### Lower-level API
 
 The module also exports `Tokenizer`, `SafeTensors`, `Model`, `QuestionType`, and `sequence` for callers that need raw tokenization or logits.
 
 Like in the standard library, the types with fields are files of their own, so `zlaya.Tokenizer` is `src/Tokenizer.zig`.
+
 `SafeTensors.open` reads only the header of a checkpoint, so keep the file open until the model is loaded.
 `Tokenizer.init` allocates everything in the arena it is given.
 `Model.init` takes an arena plus a separate allocator for the float32 weights, which `SafeTensors.totalLen` can size exactly.

@@ -70,6 +70,10 @@ pub fn deinit(st: *SafeTensors) void {
     st.* = undefined;
 }
 
+pub fn tensorCount(st: *const SafeTensors) usize {
+    return st.tensors.count();
+}
+
 /// Number of float32 values needed to convert every tensor.
 pub fn totalLen(st: *const SafeTensors) usize {
     var total: usize = 0;

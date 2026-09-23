@@ -169,6 +169,7 @@ const HeadLayer = struct {
 
 /// Converts the weights into `weights` and allocates everything else in `arena`.
 /// Nothing is freed on failure, so both allocators should be discarded on error.
+/// Every converted tensor completes one item of `progress`.
 pub fn init(
     arena: Allocator,
     weights: Allocator,
@@ -176,6 +177,7 @@ pub fn init(
     encoder_json: []const u8,
     head_layers: usize,
     actions: usize,
+    progress: std.Progress.Node,
 ) !Model {
     // Negative or oversized integers fail with Overflow.
     var config = std.json.parseFromSliceLeaky(EncoderConfig, arena, encoder_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
@@ -195,7 +197,7 @@ pub fn init(
     try checkMatrixSize(2 * f, d);
     try checkMatrixSize(config.max_position_embeddings, @max(2 * f, 4 * d));
 
-    const loader: Loader = .{ .arena = arena, .weights = weights, .tensors = tensors };
+    const loader: Loader = .{ .arena = arena, .weights = weights, .tensors = tensors, .progress = progress };
     const layers = try arena.alloc(EncoderLayer, config.num_hidden_layers);
     for (layers, 0..) |*layer, i| {
         const scope = try loader.scope(try std.fmt.allocPrint(arena, "encoder.layers.{d}", .{i}));
@@ -368,6 +370,7 @@ const Loader = struct {
     arena: Allocator,
     weights: Allocator,
     tensors: *const SafeTensors,
+    progress: std.Progress.Node,
     /// Prepended to every tensor name.
     prefix: []const u8 = "",
 
@@ -382,7 +385,9 @@ const Loader = struct {
         const full_name = try std.mem.concat(loader.arena, u8, &.{ loader.prefix, name });
         const tensor = loader.tensors.get(full_name) orelse return error.MissingTensor;
         if (!std.mem.eql(usize, tensor.shape, shape)) return error.InvalidTensorShape;
-        return loader.tensors.toF32(loader.weights, tensor);
+        const converted = try loader.tensors.toF32(loader.weights, tensor);
+        loader.progress.completeOne();
+        return converted;
     }
 
     fn norm(loader: Loader, name: []const u8, dim: usize, bias: bool, eps: f32) !Norm {
@@ -412,7 +417,7 @@ test "encoder and decision heads match PyTorch for every question type" {
     var arena_instance: std.heap.ArenaAllocator = .init(gpa);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
-    const model: Model = try .init(arena, arena, &tensors, @embedFile("fixtures/tiny-encoder.json"), 2, 2);
+    const model: Model = try .init(arena, arena, &tensors, @embedFile("fixtures/tiny-encoder.json"), 2, 2, .none);
 
     const Expected = struct { qtype: usize, logits: []f32, act_logits: []f32 };
     const expected = try std.json.parseFromSlice([]Expected, gpa, @embedFile("fixtures/tiny-expected.json"), .{});
@@ -458,7 +463,7 @@ test "unsupported encoder configurations fail before loading weights" {
         ,
     };
     for (unsupported) |config| {
-        try testing.expectError(error.UnsupportedConfiguration, init(arena, arena, &tensors, config, 2, 2));
+        try testing.expectError(error.UnsupportedConfiguration, init(arena, arena, &tensors, config, 2, 2, .none));
     }
 
     const invalid = [_][]const u8{
@@ -478,6 +483,6 @@ test "unsupported encoder configurations fail before loading weights" {
         ,
     };
     for (invalid) |config| {
-        try testing.expectError(error.InvalidConfiguration, init(arena, arena, &tensors, config, 2, 2));
+        try testing.expectError(error.InvalidConfiguration, init(arena, arena, &tensors, config, 2, 2, .none));
     }
 }

@@ -24,9 +24,19 @@ fn run(init: std.process.Init) !void {
     const request_json = try std.Io.Dir.cwd().readFileAlloc(init.io, args[2], arena, .limited(16 * 1024 * 1024));
     const request = try std.json.parseFromSliceLeaky(std.json.Value, arena, request_json, .{});
 
-    var engine: zlaya.Engine = try .load(init.gpa, init.io, args[1]);
-    defer engine.deinit();
-    const response = try engine.predict(arena, request, raw);
+    // The progress display has to be gone before the response is written.
+    const response = response: {
+        const progress = std.Progress.start(init.io, .{});
+        defer progress.end();
+        // std.Progress can't draw on WASI, in single-threaded builds, or without escape codes.
+        const plain = progress.index == .none and try std.Io.File.stderr().isTty(init.io);
+
+        if (plain) std.debug.print("Loading model from {s}...\n", .{args[1]});
+        var engine: zlaya.Engine = try .load(init.gpa, init.io, args[1], progress);
+        defer engine.deinit();
+        if (plain) std.debug.print("Answering questions...\n", .{});
+        break :response try engine.predict(arena, request, raw, progress);
+    };
 
     var buffer: [8192]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writerStreaming(init.io, &buffer);
