@@ -1,0 +1,7 @@
+*~
+LOG.*
+.zig-cache/
+zig-out/
+tmp/
+models/
+zig-pkg/
