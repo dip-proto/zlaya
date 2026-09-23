@@ -1,6 +1,6 @@
 # zlaya
 
-A CPU inference engine in Zig for the root [Laya checkpoint](https://huggingface.co/convaiinnovations/laya).
+A CPU inference engine in Zig for [Laya](https://huggingface.co/convaiinnovations/laya).
 
 It answers choice, score, and yes/no (`noul`) questions about text or structured JSON.
 
