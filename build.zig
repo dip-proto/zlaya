@@ -2,7 +2,7 @@ const std = @import("std");
 
 const Blas = enum { none, system, openblas };
 
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     var query = b.standardTargetOptionsQueryOnly(.{});
     // Enable SIMD on WebAssembly unless -Dcpu is given.
     // Every current runtime supports it.
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         },
         .openblas => {
             if (target.result.os.tag != .wasi) std.process.fatal("-Dblas=openblas is only configured for WASI targets", .{});
-            if (b.lazyDependency("openblas", .{})) |dep| mod.linkLibrary(openBlas(b, dep, target));
+            mod.linkLibrary(openBlas(b, try b.dependencyLazy("openblas", .{}), target));
         },
     }
 
