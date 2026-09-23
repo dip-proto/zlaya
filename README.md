@@ -121,7 +121,7 @@ It also runs under Node's `node:wasi` module, through the small launcher in `scr
 node scripts/zlaya-node.mjs zig-out/bin/zlaya.wasm models/laya examples/triage.json
 ```
 
-Browsers would need a WASI shim that provides file access, which has not been tried.
+Browsers would need a WASI shim that provides file access, `wasm32-freestanding` support will be added as an alternative soon.
 
 #### Memory use
 
