@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.svg" alt="zlaya logo" width="400">
+</p>
+
 # zlaya
 
 A CPU-only inference engine in Zig for [Laya](https://huggingface.co/convaiinnovations/laya).

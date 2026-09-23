@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="400" height="120" viewBox="0 0 400 120" role="img" aria-labelledby="title desc">
+  <title id="title">zlaya</title>
+  <desc id="desc">An amber Z inside a processor beside the zlaya wordmark on a navy background.</desc>
+  <rect x="1" y="1" width="398" height="118" rx="24" fill="#111827" stroke="#64748b" stroke-width="2"/>
+  <g stroke="#fbbf24" stroke-width="4" stroke-linecap="round">
+    <path d="M44 24v8m16-8v8m16-8v8M44 88v8m16-8v8m16-8v8M24 44h8m-8 16h8m-8 16h8m56-32h8m-8 16h8m-8 16h8"/>
+    <rect x="32" y="32" width="56" height="56" rx="12" fill="none"/>
+  </g>
+  <path d="M44 44h32v8L55 68h21v8H44v-8l21-16H44z" fill="#fbbf24"/>
+  <g fill="none" stroke="#f8fafc" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M130 46h28l-28 30h28"/>
+    <path d="M177 30v38q0 8 8 8h4"/>
+    <path d="M230 46v30m0-22c-4-12-28-12-28 7s24 19 28 7"/>
+    <path d="M249 46l14 30m14-30-18 40q-3 7-10 7"/>
+    <path d="M324 46v30m0-22c-4-12-28-12-28 7s24 19 28 7"/>
+  </g>
+  <circle cx="356" cy="76" r="5" fill="#fbbf24"/>
+</svg>
