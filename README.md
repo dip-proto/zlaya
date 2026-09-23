@@ -5,7 +5,7 @@
 # zlaya
 
 A CPU-only inference engine in Zig for [Laya](https://huggingface.co/convaiinnovations/laya).
-It needs no GPU and can run entirely in WebAssembly, including in edge applications running on CDNs.
+It needs no GPU and can run entirely in WebAssembly.
 
 It answers choice, score, and yes/no (`noul`) questions about text or structured JSON.
 Inference runs locally using native Zig tokenization, safetensors loading, ModernBERT, and the trained decision and action heads.
