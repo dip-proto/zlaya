@@ -164,15 +164,14 @@ Pass `.none` if you don't need progress.
 
 The module also exports `Tokenizer`, `SafeTensors`, `Model`, `QuestionType`, `kernels`, and `sequence` for callers that need raw tokenization or logits.
 
-Like in the standard library, the types with fields are files of their own, so `zlaya.Tokenizer` is `src/Tokenizer.zig`.
-
 `SafeTensors.open` reads only the header of a checkpoint, so keep the file open until the model is loaded.
 `Tokenizer.init` allocates everything in the arena it is given.
 `Model.init` takes an allocator for temporary memory, an arena, a separate allocator for the float32 weights, which `SafeTensors.totalLen` can size exactly, and a `kernels.Pool`.
 
-`kernels.Pool.init(gpa, io)` starts a worker thread for every CPU but one, unless the build is single-threaded, and `deinit(gpa)` stops them.
-`kernels.Pool.serial` runs everything on the calling thread.
+`kernels.Pool.init(gpa, io)` starts a worker thread for every CPU but one, unless the build is single-threaded, and `deinit(gpa)` stops them. And `kernels.Pool.serial` runs everything on the calling thread.
+
 Predictions that share a pool take turns using its worker threads.
 
 `Model.forward` takes an allocator for scratch memory, a pool, token IDs, option marker positions, and a `QuestionType`.
+
 It returns a `Model.Output`, whose `deinit(gpa)` frees the logits.
