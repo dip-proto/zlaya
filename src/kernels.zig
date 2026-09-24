@@ -216,14 +216,14 @@ pub const Pool = struct {
             for (0..jobs) |index| job(context, index, 0);
             return;
         };
-        const count = std.math.cast(u32, jobs) orelse @panic("too many jobs for one batch");
+        const count: u64 = std.math.cast(u32, jobs) orelse @panic("too many jobs for one batch");
         shared.mutex.lockUncancelable(shared.io);
         defer shared.mutex.unlock(shared.io);
 
         shared.batch = .{ .context = @ptrCast(@constCast(context)), .job = Erased.call };
         shared.completed.store(0, .monotonic);
         shared.slots.store(0, .monotonic);
-        shared.state.store(@as(u64, count) << 32, .release);
+        shared.state.store(count << 32, .release);
         _ = shared.generation.fetchAdd(1, .seq_cst);
         if (shared.sleeping.load(.seq_cst) != 0) {
             shared.io.futexWake(u32, &shared.generation.raw, std.math.maxInt(u32));
@@ -316,8 +316,8 @@ fn exp(x: V) V {
     const y = mulAdd(p, r * r, r) + @as(V, @splat(1));
 
     const U = @Vector(vector_len, u32);
-    const exponent = (@as(U, @bitCast(shifted)) << @splat(23)) +% @as(U, @splat(127 << 23));
-    const scale: V = @bitCast(exponent);
+    const bits: U = @bitCast(shifted);
+    const scale: V = @bitCast((bits << @splat(23)) +% @as(U, @splat(127 << 23)));
     return @select(f32, x < @as(V, @splat(-87)), @as(V, @splat(0)), y * scale);
 }
 
@@ -420,7 +420,7 @@ pub fn layerNorm(
             i = 0;
             while (i < dim) : (i += vector_len) {
                 const normalized = (load(values, i, 0) - means) * scale * load(norm.weight, i, 0);
-                store(target, i, normalized + if (norm.bias) |b| load(b, i, 0) else @as(V, @splat(0)));
+                store(target, i, if (norm.bias) |b| normalized + load(b, i, 0) else normalized);
             }
         }
     };
@@ -653,11 +653,11 @@ const Gemm = struct {
 
         /// Both were tuned with Accelerate on an Apple M5 Max.
         const blas_workers = 8;
-        const zig_share = 1.0 / 4.0;
+        /// The Zig kernel gets one panel out of this many.
+        const zig_share = 4;
 
         fn init(gemm: *const Gemm) Split {
-            const panel_count: f32 = @floatFromInt(gemm.panels());
-            return .{ .gemm = gemm, .blas_panels = @intFromFloat(@floor(panel_count * (1 - zig_share))) };
+            return .{ .gemm = gemm, .blas_panels = gemm.panels() - @divCeil(gemm.panels(), zig_share) };
         }
 
         fn work(split: *Split, _: usize, worker: usize) void {
@@ -750,12 +750,14 @@ pub const Rope = struct {
         const half = head_dim / 2;
         const cos = try arena.alloc(f32, seq * half);
         const sin = try arena.alloc(f32, seq * half);
+        const dims: f32 = @floatFromInt(head_dim);
         for (0..half) |i| {
             // Multiplying by the inverse frequency, instead of dividing, rounds like PyTorch.
-            const exponent = @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(head_dim));
-            const frequency = 1 / std.math.pow(f32, theta, exponent);
+            const index: f32 = @floatFromInt(2 * i);
+            const frequency = 1 / std.math.pow(f32, theta, index / dims);
             for (0..seq) |t| {
-                const angle = @as(f32, @floatFromInt(t)) * frequency;
+                const position: f32 = @floatFromInt(t);
+                const angle = position * frequency;
                 cos[t * half + i] = @cos(angle);
                 sin[t * half + i] = @sin(angle);
             }
@@ -882,6 +884,8 @@ const Attention = struct {
         const scores = att.scores[worker * query_block * padded ..][0 .. query_block * padded];
         const out = att.out[first * att.dim + head * d ..];
 
+        const head_dim: f32 = @floatFromInt(d);
+
         // Scores cover whole tiles of keys, starting at `base`.
         const base = std.mem.alignBackward(usize, lo, tile_width);
         const width = std.mem.alignForward(usize, hi, tile_width) - base;
@@ -894,7 +898,7 @@ const Attention = struct {
             .len = d,
             .out = scores,
             .out_stride = width,
-            .scale = 1 / @sqrt(@as(f32, @floatFromInt(d))),
+            .scale = 1 / @sqrt(head_dim),
         };
         products.compute(count, width / tile_width);
         att.normalize(scores, width, first, count, base);
@@ -1126,10 +1130,9 @@ test "vector exp and gelu stay close to libm" {
     var x: f32 = -10;
     while (x < 10) : (x += 0.001) {
         const v: V = @splat(x);
-        const want_exp = @exp(@as(f64, x));
-        try testing.expectApproxEqRel(want_exp, @as(f64, exp(v)[0]), 3e-7);
-        const want_gelu = 0.5 * @as(f64, x) * (1 + erf(@as(f64, x) * std.math.sqrt1_2));
-        try testing.expectApproxEqAbs(want_gelu, @as(f64, geluVector(v)[0]), 1e-6);
+        const wide: f64 = x;
+        try testing.expectApproxEqRel(@exp(wide), exp(v)[0], 3e-7);
+        try testing.expectApproxEqAbs(0.5 * wide * (1 + erf(wide * std.math.sqrt1_2)), geluVector(v)[0], 1e-6);
     }
     try testing.expectEqual(0, exp(@splat(-100))[0]);
     try testing.expect(std.math.isNan(exp(@splat(std.math.nan(f32)))[0]));
@@ -1139,10 +1142,9 @@ test "vector exp and gelu stay close to libm" {
 test softmax {
     var values = [_]f32{ 1, 2, 3, 4, 5, -1e30 };
     softmax(&values);
+    const exps = [_]f64{ @exp(1.0), @exp(2.0), @exp(3.0), @exp(4.0), @exp(5.0) };
     var total: f64 = 0;
-    for (0..5) |i| total += @exp(@as(f64, @floatFromInt(i)));
-    for (values[0..5], 0..) |p, i| {
-        try testing.expectApproxEqRel(@exp(@as(f64, @floatFromInt(i))) / total, p, 1e-6);
-    }
+    for (exps) |e| total += e;
+    for (values[0..5], exps) |p, e| try testing.expectApproxEqRel(e / total, p, 1e-6);
     try testing.expectEqual(0, values[5]);
 }

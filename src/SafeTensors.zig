@@ -220,8 +220,9 @@ fn widen(dtype: DType, values: []f32) void {
 }
 
 fn widenHalves(comptime dtype: DType, comptime lanes: usize, halves: @Vector(lanes, u16)) @Vector(lanes, f32) {
-    if (dtype == .BF16) return @bitCast(@as(@Vector(lanes, u32), halves) << @splat(16));
-    return halfToSingle(lanes, halves);
+    if (dtype == .F16) return halfToSingle(lanes, halves);
+    const bits: @Vector(lanes, u32) = halves;
+    return @bitCast(bits << @splat(16));
 }
 
 /// Only AArch64 is sure to convert half floats with a single instruction.
@@ -229,8 +230,9 @@ fn widenHalves(comptime dtype: DType, comptime lanes: usize, halves: @Vector(lan
 const native_half = builtin.cpu.arch.isAARCH64();
 
 fn halfToSingle(comptime lanes: usize, half: @Vector(lanes, u16)) @Vector(lanes, f32) {
-    if (native_half) return @floatCast(@as(@Vector(lanes, f16), @bitCast(half)));
-    return widenHalfBits(lanes, half);
+    if (!native_half) return widenHalfBits(lanes, half);
+    const floats: @Vector(lanes, f16) = @bitCast(half);
+    return @floatCast(floats);
 }
 
 /// Widens half floats exactly, with integer and single-precision operations only.
@@ -238,10 +240,12 @@ fn widenHalfBits(comptime lanes: usize, half: @Vector(lanes, u16)) @Vector(lanes
     const U = @Vector(lanes, u32);
     const F = @Vector(lanes, f32);
     const bits: U = half;
+    const unscaled: F = @bitCast((bits & @as(U, @splat(0x7fff))) << @splat(13));
     // Multiplying by 2^112 fixes the exponent bias, and turns subnormals into normal numbers.
-    const magnitude = @as(F, @bitCast((bits & @as(U, @splat(0x7fff))) << @splat(13))) * @as(F, @splat(0x1p112));
-    const infinite_or_nan = magnitude >= @as(F, @splat(0x1p16));
-    const widened = @select(u32, infinite_or_nan, @as(U, @bitCast(magnitude)) | @as(U, @splat(0x7f80_0000)), @as(U, @bitCast(magnitude)));
+    const scaled = unscaled * @as(F, @splat(0x1p112));
+    const magnitude: U = @bitCast(scaled);
+    const infinite_or_nan = scaled >= @as(F, @splat(0x1p16));
+    const widened = @select(u32, infinite_or_nan, magnitude | @as(U, @splat(0x7f80_0000)), magnitude);
     return @bitCast(widened | (bits & @as(U, @splat(0x8000))) << @splat(16));
 }
 
@@ -367,12 +371,15 @@ test "reject duplicate names, invalid metadata and unsupported storage types" {
 test "half floats widen exactly" {
     var half: u16 = 0;
     while (true) : (half += 1) {
-        const want: f32 = @floatCast(@as(f16, @bitCast(half)));
+        const value: f16 = @bitCast(half);
+        const want: f32 = value;
         for ([_]f32{ halfToSingle(1, .{half})[0], widenHalfBits(1, .{half})[0] }) |got| {
             if (std.math.isNan(want)) {
                 try testing.expect(std.math.isNan(got));
             } else {
-                try testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+                const want_bits: u32 = @bitCast(want);
+                const got_bits: u32 = @bitCast(got);
+                try testing.expectEqual(want_bits, got_bits);
             }
         }
         if (half == std.math.maxInt(u16)) break;
