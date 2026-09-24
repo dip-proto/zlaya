@@ -102,8 +102,6 @@ zig build -Doptimize=ReleaseFast -Dblas=system
 `system` links Accelerate on macOS, and elsewhere a system library exposing `cblas_sgemm` as `libblas`.
 The split between BLAS and the Zig kernel was tuned for Accelerate.
 
-A third value, `openblas`, compiles OpenBLAS from source for WebAssembly, and is only supported there.
-
 ### WebAssembly
 
 ```sh
@@ -118,9 +116,6 @@ SIMD and relaxed SIMD are enabled by default.
 Relaxed SIMD provides a fused multiply-add, which makes inference almost twice as fast, and wasmtime, wasmer, and Node all support it.
 
 An explicit `-Dcpu` takes precedence, for example `-Dcpu=generic+simd128` for a runtime without relaxed SIMD.
-
-`-Dblas=openblas` downloads OpenBLAS and compiles it to WebAssembly instead.
-It is about a third as fast as the Zig kernels, and native builds never fetch it.
 
 #### Runtime file access
 

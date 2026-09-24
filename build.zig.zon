@@ -3,13 +3,6 @@
     .version = "0.1.0",
     .fingerprint = 0x89ed75aef155c6fe,
     .minimum_zig_version = "0.17.0-dev.2234+80fe9b2b7",
-    .dependencies = .{
-        .openblas = .{
-            .url = "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.34/OpenBLAS-0.3.34.tar.gz",
-            .hash = "N-V-__8AAG9D_grU_uvUifnH883c6hLZJ_hZB4VXDok-I1AL",
-            .lazy = true,
-        },
-    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
