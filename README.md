@@ -74,6 +74,7 @@ Redirecting stderr hides it, but errors are still reported there.
 ### Context limits and debugging
 
 The checkpoint's default context budget is 512 tokens, with a 192-token question/options budget.
+
 Long text keeps its beginning; long conversation lists keep their end.
 An error is returned if an option marker would be truncated away.
 
@@ -83,10 +84,11 @@ Use `--raw` as the final argument to include token IDs, marker positions, option
 
 ### Native backends
 
-On macOS, the default build uses Apple's Accelerate CPU BLAS for matrix multiplication.
-The rest of the model executes in Zig.
+zlaya runs on every CPU core, with its own vectorized kernels for matrix products, attention, normalization, and activations.
 
-On other systems, the default uses the portable Zig matrix kernels and libc's error function.
+Weights are rearranged into panels while loading, so that the matrix kernel reads them in order.
+
+On macOS, the default build also uses Apple's Accelerate. On other systems, the default uses the Zig kernels alone.
 
 You can select the backend explicitly with `-Dblas`:
 
@@ -95,10 +97,12 @@ zig build -Doptimize=ReleaseFast -Dblas=none
 zig build -Doptimize=ReleaseFast -Dblas=system
 ```
 
-`none` uses the portable Zig kernels.
+`none` uses the Zig kernels alone.
 
 `system` links Accelerate on macOS, and elsewhere a system library exposing `cblas_sgemm` as `libblas`.
-A third value, `openblas`, compiles OpenBLAS from source; it is the default for WebAssembly and only supported there.
+The split between BLAS and the Zig kernel was tuned for Accelerate.
+
+A third value, `openblas`, compiles OpenBLAS from source for WebAssembly, and is only supported there.
 
 ### WebAssembly
 
@@ -108,14 +112,15 @@ wasmtime run --dir . zig-out/bin/zlaya.wasm models/laya examples/triage.json
 ```
 
 This produces `zig-out/bin/zlaya.wasm`, a WASI program that takes the same arguments and prints the same answers as the native one.
-For matrix multiplication, the build downloads OpenBLAS from source and compiles it to WebAssembly.
+It uses the Zig kernels on a single thread, and building it needs nothing besides Zig.
 
-Building needs nothing besides Zig, and native builds never fetch OpenBLAS.
+SIMD and relaxed SIMD are enabled by default.
+Relaxed SIMD provides a fused multiply-add, which makes inference almost twice as fast, and wasmtime, wasmer, and Node all support it.
 
-Pass `-Dblas=none` to use the portable Zig kernels instead.
+An explicit `-Dcpu` takes precedence, for example `-Dcpu=generic+simd128` for a runtime without relaxed SIMD.
 
-WebAssembly SIMD is enabled by default, since every current runtime supports it and it roughly halves inference time.
-An explicit `-Dcpu`, such as `-Dcpu=mvp`, takes precedence, and OpenBLAS then uses its scalar code paths.
+`-Dblas=openblas` downloads OpenBLAS and compiles it to WebAssembly instead.
+It is about a third as fast as the Zig kernels, and native builds never fetch it.
 
 #### Runtime file access
 
@@ -139,6 +144,7 @@ Browsers would need a WASI shim that provides file access, but `wasm32-freestand
 #### Memory use
 
 On every target, the checkpoint is read tensor by tensor into a single float32 buffer, without ever holding the whole file.
+
 WebAssembly depends on this: wasm32 can address only 4 GiB, and its allocator rounds large blocks up to powers of two.
 The WebAssembly memory reaches about 2.1 GiB after loading, and 2.8 GiB with a full 512-token prompt.
 
@@ -150,6 +156,7 @@ Import the `zlaya` module exported by `build.zig`.
 
 `Engine.load(gpa, io, model_directory, progress)` loads reusable weights and tokenization data; call `deinit()` when finished.
 The same allocator provides scratch memory for each prediction.
+The engine's worker threads keep using `io`, so it has to outlive the engine.
 
 `engine.predict(arena, request_value, false, progress)` returns a `std.json.Value` response allocated in `arena`.
 Use a fresh arena for each request and free it after consuming the response.
@@ -160,13 +167,17 @@ Pass `.none` if you don't need progress.
 
 ### Lower-level API
 
-The module also exports `Tokenizer`, `SafeTensors`, `Model`, `QuestionType`, and `sequence` for callers that need raw tokenization or logits.
+The module also exports `Tokenizer`, `SafeTensors`, `Model`, `QuestionType`, `kernels`, and `sequence` for callers that need raw tokenization or logits.
 
 Like in the standard library, the types with fields are files of their own, so `zlaya.Tokenizer` is `src/Tokenizer.zig`.
 
 `SafeTensors.open` reads only the header of a checkpoint, so keep the file open until the model is loaded.
 `Tokenizer.init` allocates everything in the arena it is given.
-`Model.init` takes an arena plus a separate allocator for the float32 weights, which `SafeTensors.totalLen` can size exactly.
+`Model.init` takes an allocator for temporary memory, an arena, a separate allocator for the float32 weights, which `SafeTensors.totalLen` can size exactly, and a `kernels.Pool`.
 
-`Model.forward` takes token IDs, option marker positions, and a `QuestionType`.
+`kernels.Pool.init(gpa, io)` starts a worker thread for every CPU but one, unless the build is single-threaded, and `deinit(gpa)` stops them.
+`kernels.Pool.serial` runs everything on the calling thread.
+Predictions that share a pool take turns using its worker threads.
+
+`Model.forward` takes an allocator for scratch memory, a pool, token IDs, option marker positions, and a `QuestionType`.
 It returns a `Model.Output`, whose `deinit(gpa)` frees the logits.

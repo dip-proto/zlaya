@@ -13,6 +13,7 @@ const SafeTensors = @import("SafeTensors.zig");
 const Tokenizer = @import("Tokenizer.zig");
 
 gpa: Allocator,
+pool: kernels.Pool,
 /// Holds the tokenizer and everything in the model except its weights.
 arena: *std.heap.ArenaAllocator,
 weights: []f32,
@@ -63,6 +64,7 @@ fn clampTemperature(value: Value) f32 {
 }
 
 /// `gpa` is also used for scratch memory during predictions.
+/// Kernels run on a thread for every CPU, and those threads use `io` until `deinit`, so it must outlive the engine.
 /// Progress is reported under `progress`, one item per converted tensor.
 pub fn load(gpa: Allocator, io: std.Io, path: []const u8, progress: std.Progress.Node) !Engine {
     const arena = try gpa.create(std.heap.ArenaAllocator);
@@ -108,10 +110,13 @@ pub fn load(gpa: Allocator, io: std.Io, path: []const u8, progress: std.Progress
     errdefer gpa.free(weights);
     var weight_buffer: std.heap.FixedBufferAllocator = .init(std.mem.sliceAsBytes(weights));
     const actions = if (config.act_costs) |costs| costs.map.count() + 1 else 2;
-    const model: Model = try .init(arena.allocator(), weight_buffer.allocator(), &tensors, encoder_json, config.head_layers, actions, node);
+    const pool: kernels.Pool = try .init(gpa, io);
+    errdefer pool.deinit(gpa);
+    const model: Model = try .init(gpa, arena.allocator(), weight_buffer.allocator(), pool, &tensors, encoder_json, config.head_layers, actions, node);
 
     return .{
         .gpa = gpa,
+        .pool = pool,
         .arena = arena,
         .weights = weights,
         .tokenizer = tokenizer,
@@ -123,6 +128,7 @@ pub fn load(gpa: Allocator, io: std.Io, path: []const u8, progress: std.Progress
 }
 
 pub fn deinit(engine: *Engine) void {
+    engine.pool.deinit(engine.gpa);
     engine.gpa.free(engine.weights);
     engine.arena.deinit();
     engine.gpa.destroy(engine.arena);
@@ -168,7 +174,7 @@ fn answer(
     raw: bool,
 ) !Value {
     const seq = try sequence.build(scratch, &engine.tokenizer, state, question, engine.max_len, engine.head_max_len);
-    const result = try engine.model.forward(scratch, seq.ids, seq.markers, seq.qtype);
+    const result = try engine.model.forward(scratch, engine.pool, seq.ids, seq.markers, seq.qtype);
 
     const probs = try scratch.dupe(f32, result.logits);
     const temperature = engine.temperatures.get(seq.qtype)[bucket(probs.len)];

@@ -132,8 +132,8 @@ const Linear = struct {
     inputs: usize,
     outputs: usize,
 
-    fn run(linear: Linear, x: []const f32, out: []f32) void {
-        kernels.linear(x, linear.weight, linear.bias, out, linear.inputs, linear.outputs);
+    fn run(linear: Linear, pool: kernels.Pool, x: []const f32, out: []f32, mode: kernels.Store) void {
+        kernels.linear(pool, x, linear.weight, linear.bias, out, linear.inputs, linear.outputs, mode);
     }
 };
 
@@ -142,8 +142,8 @@ const Norm = struct {
     bias: ?[]const f32,
     eps: f32,
 
-    fn run(norm: Norm, x: []const f32, out: []f32) void {
-        kernels.layerNorm(x, norm.weight, norm.bias, out, norm.eps);
+    fn run(norm: Norm, pool: kernels.Pool, x: []const f32, out: []f32) void {
+        kernels.layerNorm(pool, x, norm.weight, norm.bias, out, norm.eps);
     }
 };
 
@@ -165,14 +165,27 @@ const HeadLayer = struct {
     attention_out: Linear,
     linear1: Linear,
     linear2: Linear,
+
+    /// Runs the rest of the layer after attention.
+    /// From here on each row is handled on its own, so callers can pass any subset of rows.
+    fn finish(layer: HeadLayer, pool: kernels.Pool, attended: []const f32, x: []f32, normed: []f32, hidden: []f32) void {
+        layer.attention_out.run(pool, attended, x, .add);
+        layer.norm2.run(pool, x, normed);
+        layer.linear1.run(pool, normed, hidden, .replace);
+        for (hidden) |*value| value.* = @max(0, value.*);
+        layer.linear2.run(pool, hidden, x, .add);
+    }
 };
 
 /// Converts the weights into `weights` and allocates everything else in `arena`.
 /// Nothing is freed on failure, so both allocators should be discarded on error.
+/// `pool` rearranges the weights for the kernels, using temporary memory from `gpa`.
 /// Every converted tensor completes one item of `progress`.
 pub fn init(
+    gpa: Allocator,
     arena: Allocator,
     weights: Allocator,
+    pool: kernels.Pool,
     tensors: *const SafeTensors,
     encoder_json: []const u8,
     head_layers: usize,
@@ -197,7 +210,16 @@ pub fn init(
     try checkMatrixSize(2 * f, d);
     try checkMatrixSize(config.max_position_embeddings, @max(2 * f, 4 * d));
 
-    const loader: Loader = .{ .arena = arena, .weights = weights, .tensors = tensors, .progress = progress };
+    const pack_buffer = try gpa.alloc(f32, kernels.packBufferLen(pool, @max(f, 4 * d, d + 4, act_hidden_size)));
+    defer gpa.free(pack_buffer);
+    const loader: Loader = .{
+        .arena = arena,
+        .weights = weights,
+        .tensors = tensors,
+        .pool = pool,
+        .pack_buffer = pack_buffer,
+        .progress = progress,
+    };
     const layers = try arena.alloc(EncoderLayer, config.num_hidden_layers);
     for (layers, 0..) |*layer, i| {
         const scope = try loader.scope(try std.fmt.allocPrint(arena, "encoder.layers.{d}", .{i}));
@@ -222,12 +244,7 @@ pub fn init(
         layer.* = .{
             .norm1 = try scope.norm("norm1", d, true, head_norm_eps),
             .norm2 = try scope.norm("norm2", d, true, head_norm_eps),
-            .qkv = .{
-                .weight = try scope.weight("self_attn.in_proj_weight", &.{ 3 * d, d }),
-                .bias = try scope.weight("self_attn.in_proj_bias", &.{3 * d}),
-                .inputs = d,
-                .outputs = 3 * d,
-            },
+            .qkv = try scope.linearNamed("self_attn.in_proj_weight", "self_attn.in_proj_bias", d, 3 * d),
             .attention_out = try scope.linear("self_attn.out_proj", d, d, true),
             .linear1 = try scope.linear("linear1", d, 4 * d, true),
             .linear2 = try scope.linear("linear2", 4 * d, d, true),
@@ -259,7 +276,14 @@ pub fn init(
 }
 
 /// Returns one logit per option marker, and the action logits.
-pub fn forward(model: *const Model, gpa: Allocator, ids: []const u32, markers: []const usize, qtype: QuestionType) !Output {
+pub fn forward(
+    model: *const Model,
+    gpa: Allocator,
+    pool: kernels.Pool,
+    ids: []const u32,
+    markers: []const usize,
+    qtype: QuestionType,
+) !Output {
     const d = model.hidden_size;
     const f = model.intermediate_size;
     const n = ids.len;
@@ -276,61 +300,64 @@ pub fn forward(model: *const Model, gpa: Allocator, ids: []const u32, markers: [
     const qkv = try arena.alloc(f32, n * 3 * d);
     const ff = try arena.alloc(f32, n * @max(2 * f, 4 * d));
     const gate = try arena.alloc(f32, n * f);
-    const scores = try arena.alloc(f32, n * n);
+    const scratch = try arena.alloc(f32, kernels.attentionScratchLen(pool, n, d, @max(model.heads, model.head_heads)));
     const global_rope: kernels.Rope = try .init(arena, n, d / model.heads, model.global_rope_theta);
     const local_rope: kernels.Rope = try .init(arena, n, d / model.heads, model.local_rope_theta);
 
     for (ids, 0..) |id, i| @memcpy(y[i * d ..][0..d], model.embeddings[id * d ..][0..d]);
-    model.embedding_norm.run(y, x);
+    model.embedding_norm.run(pool, y, x);
 
     for (model.layers) |layer| {
         const normed = if (layer.attention_norm) |norm| blk: {
-            norm.run(x, y);
+            norm.run(pool, x, y);
             break :blk y;
         } else x;
-        layer.qkv.run(normed, qkv);
+        layer.qkv.run(pool, normed, qkv, .replace);
         const window = if (layer.global) null else model.local_window;
         const rope = if (layer.global) global_rope else local_rope;
-        kernels.attention(qkv, z, scores, n, d, model.heads, window, rope);
-        layer.attention_out.run(z, y);
-        add(x, y);
+        kernels.attention(pool, qkv, z, scratch, n, d, model.heads, window, rope);
+        layer.attention_out.run(pool, z, x, .add);
 
-        layer.mlp_norm.run(x, y);
-        layer.mlp_in.run(y, ff[0 .. n * 2 * f]);
-        for (0..n) |row| for (0..f) |j| {
-            gate[row * f + j] = kernels.gelu(ff[row * 2 * f + j]) * ff[row * 2 * f + f + j];
-        };
-        layer.mlp_out.run(gate, y);
-        add(x, y);
+        layer.mlp_norm.run(pool, x, y);
+        layer.mlp_in.run(pool, y, ff[0 .. n * 2 * f], .replace);
+        kernels.geluGate(pool, ff[0 .. n * 2 * f], gate, f);
+        layer.mlp_out.run(pool, gate, x, .add);
     }
-    model.final_norm.run(x, y);
+    model.final_norm.run(pool, x, y);
 
     const type_embedding = model.type_embeddings[@backingInt(qtype) * d ..][0..d];
-    for (x, y, 0..) |*value, encoded, i| value.* = encoded + type_embedding[i % d];
-
-    for (model.head) |layer| {
-        layer.norm1.run(x, y);
-        layer.qkv.run(y, qkv);
-        kernels.attention(qkv, z, scores, n, d, model.head_heads, null, null);
-        layer.attention_out.run(z, y);
-        add(x, y);
-
-        layer.norm2.run(x, y);
-        const hidden = ff[0 .. n * 4 * d];
-        layer.linear1.run(y, hidden);
-        for (hidden) |*value| value.* = @max(0, value.*);
-        layer.linear2.run(hidden, y);
-        add(x, y);
+    for (0..n) |row| {
+        for (x[row * d ..][0..d], y[row * d ..][0..d], type_embedding) |*value, encoded, offset| value.* = encoded + offset;
     }
 
+    for (model.head, 0..) |layer, i| {
+        layer.norm1.run(pool, x, y);
+        layer.qkv.run(pool, y, qkv, .replace);
+        kernels.attention(pool, qkv, z, scratch, n, d, model.head_heads, null, null);
+        if (i + 1 < model.head.len) layer.finish(pool, z, x, y, ff[0 .. n * 4 * d]);
+    }
+
+    // Only the first token and the option markers are read after the decision head, so its last layer finishes on those rows alone.
+    const kept = markers.len + 1;
+    const selected = try arena.alloc(f32, kept * d);
+    gatherRows(selected, x, markers, d);
+    if (model.head.len > 0) {
+        const attended = try arena.alloc(f32, kept * d);
+        gatherRows(attended, z, markers, d);
+        const normed = try arena.alloc(f32, kept * d);
+        const hidden = try arena.alloc(f32, kept * 4 * d);
+        model.head[model.head.len - 1].finish(pool, attended, selected, normed, hidden);
+    }
+
+    const options = selected[d..];
+    const normed_options = try arena.alloc(f32, options.len);
+    model.scorer_norm.run(pool, options, normed_options);
+    const scored_options = try arena.alloc(f32, options.len);
+    model.scorer_in.run(pool, normed_options, scored_options, .replace);
+    kernels.gelu(scored_options);
     const logits = try gpa.alloc(f32, markers.len);
     errdefer gpa.free(logits);
-    for (markers, logits) |pos, *logit| {
-        model.scorer_norm.run(x[pos * d ..][0..d], y[0..d]);
-        model.scorer_in.run(y[0..d], z[0..d]);
-        for (z[0..d]) |*value| value.* = kernels.gelu(value.*);
-        model.scorer_out.run(z[0..d], logit[0..1]);
-    }
+    model.scorer_out.run(pool, scored_options, logits, .replace);
 
     // The action head sees the first token and a summary of the option distribution.
     const probs = try arena.dupe(f32, logits);
@@ -349,20 +376,23 @@ pub fn forward(model: *const Model, gpa: Allocator, ids: []const u32, markers: [
     }
     const count: f32 = @floatFromInt(@max(markers.len, 2));
     const features = try arena.alloc(f32, d + 4);
-    @memcpy(features[0..d], x[0..d]);
+    @memcpy(features[0..d], selected[0..d]);
     features[d..][0..4].* = .{ top1, top1 - top2, entropy / @log(count), count / 255.0 };
 
     var act_hidden: [act_hidden_size]f32 = undefined;
-    model.act_in.run(features, &act_hidden);
-    for (&act_hidden) |*value| value.* = kernels.gelu(value.*);
+    model.act_in.run(pool, features, &act_hidden, .replace);
+    kernels.gelu(&act_hidden);
     const act_logits = try gpa.alloc(f32, model.act_out.outputs);
-    model.act_out.run(&act_hidden, act_logits);
+    errdefer gpa.free(act_logits);
+    model.act_out.run(pool, &act_hidden, act_logits, .replace);
 
     return .{ .logits = logits, .act_logits = act_logits };
 }
 
-fn add(dst: []f32, src: []const f32) void {
-    for (dst, src) |*a, b| a.* += b;
+/// Copies the first row of `rows`, then the rows at `markers`, into `out`.
+fn gatherRows(out: []f32, rows: []const f32, markers: []const usize, d: usize) void {
+    @memcpy(out[0..d], rows[0..d]);
+    for (markers, 1..) |pos, i| @memcpy(out[i * d ..][0..d], rows[pos * d ..][0..d]);
 }
 
 /// Converts named tensors to float32 after checking their shapes.
@@ -370,6 +400,9 @@ const Loader = struct {
     arena: Allocator,
     weights: Allocator,
     tensors: *const SafeTensors,
+    pool: kernels.Pool,
+    /// Scratch space for `kernels.packWeights`.
+    pack_buffer: []f32,
     progress: std.Progress.Node,
     /// Prepended to every tensor name.
     prefix: []const u8 = "",
@@ -381,7 +414,7 @@ const Loader = struct {
         return scoped;
     }
 
-    fn weight(loader: Loader, name: []const u8, shape: []const usize) ![]const f32 {
+    fn weight(loader: Loader, name: []const u8, shape: []const usize) ![]f32 {
         const full_name = try std.mem.concat(loader.arena, u8, &.{ loader.prefix, name });
         const tensor = loader.tensors.get(full_name) orelse return error.MissingTensor;
         if (!std.mem.eql(usize, tensor.shape, shape)) return error.InvalidTensorShape;
@@ -401,9 +434,15 @@ const Loader = struct {
 
     fn linear(loader: Loader, name: []const u8, inputs: usize, outputs: usize, bias: bool) !Linear {
         const scoped = try loader.scope(name);
+        return scoped.linearNamed("weight", if (bias) "bias" else null, inputs, outputs);
+    }
+
+    fn linearNamed(loader: Loader, weight_name: []const u8, bias_name: ?[]const u8, inputs: usize, outputs: usize) !Linear {
+        const matrix = try loader.weight(weight_name, &.{ outputs, inputs });
+        kernels.packWeights(loader.pool, matrix, inputs, loader.pack_buffer);
         return .{
-            .weight = try scoped.weight("weight", &.{ outputs, inputs }),
-            .bias = if (bias) try scoped.weight("bias", &.{outputs}) else null,
+            .weight = matrix,
+            .bias = if (bias_name) |name| try loader.weight(name, &.{outputs}) else null,
             .inputs = inputs,
             .outputs = outputs,
         };
@@ -417,22 +456,29 @@ test "encoder and decision heads match PyTorch for every question type" {
     var arena_instance: std.heap.ArenaAllocator = .init(gpa);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
-    const model: Model = try .init(arena, arena, &tensors, @embedFile("fixtures/tiny-encoder.json"), 2, 2, .none);
+    const pool: kernels.Pool = try .init(gpa, testing.io);
+    defer pool.deinit(gpa);
+    const model: Model = try .init(gpa, arena, arena, pool, &tensors, @embedFile("fixtures/tiny-encoder.json"), 2, 2, .none);
 
     const Expected = struct { qtype: usize, logits: []f32, act_logits: []f32 };
     const expected = try std.json.parseFromSlice([]Expected, gpa, @embedFile("fixtures/tiny-expected.json"), .{});
     defer expected.deinit();
     for (expected.value) |row| {
         const qtype: QuestionType = @fromBackingInt(@intCast(row.qtype));
-        const output = try model.forward(gpa, &.{ 1, 4, 9, 3, 7, 5, 2 }, &.{ 2, 4, 5 }, qtype);
+        const output = try model.forward(gpa, pool, &.{ 1, 4, 9, 3, 7, 5, 2 }, &.{ 2, 4, 5 }, qtype);
         defer output.deinit(gpa);
         for (row.logits, output.logits) |want, got| try testing.expectApproxEqAbs(want, got, 2e-5);
         for (row.act_logits, output.act_logits) |want, got| try testing.expectApproxEqAbs(want, got, 2e-5);
     }
 
-    try testing.expectError(error.InvalidInput, model.forward(gpa, &.{}, &.{0}, .choice));
-    try testing.expectError(error.InvalidToken, model.forward(gpa, &.{19}, &.{0}, .choice));
-    try testing.expectError(error.InvalidMarker, model.forward(gpa, &.{1}, &.{1}, .choice));
+    try testing.expectError(error.InvalidInput, model.forward(gpa, pool, &.{}, &.{0}, .choice));
+    try testing.expectError(error.InvalidToken, model.forward(gpa, pool, &.{19}, &.{0}, .choice));
+    try testing.expectError(error.InvalidMarker, model.forward(gpa, pool, &.{1}, &.{1}, .choice));
+
+    // Here the head keeps more rows than there are tokens.
+    const single = try model.forward(gpa, pool, &.{1}, &.{0}, .choice);
+    defer single.deinit(gpa);
+    try testing.expect(std.math.isFinite(single.logits[0]));
 }
 
 test "unsupported encoder configurations fail before loading weights" {
@@ -463,7 +509,7 @@ test "unsupported encoder configurations fail before loading weights" {
         ,
     };
     for (unsupported) |config| {
-        try testing.expectError(error.UnsupportedConfiguration, init(arena, arena, &tensors, config, 2, 2, .none));
+        try testing.expectError(error.UnsupportedConfiguration, init(testing.allocator, arena, arena, .serial, &tensors, config, 2, 2, .none));
     }
 
     const invalid = [_][]const u8{
@@ -483,6 +529,6 @@ test "unsupported encoder configurations fail before loading weights" {
         ,
     };
     for (invalid) |config| {
-        try testing.expectError(error.InvalidConfiguration, init(arena, arena, &tensors, config, 2, 2, .none));
+        try testing.expectError(error.InvalidConfiguration, init(testing.allocator, arena, arena, .serial, &tensors, config, 2, 2, .none));
     }
 }

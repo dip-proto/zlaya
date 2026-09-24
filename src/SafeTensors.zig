@@ -4,6 +4,8 @@
 const SafeTensors = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
+const native_endian = builtin.cpu.arch.endian();
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
@@ -91,23 +93,23 @@ pub fn get(st: *const SafeTensors, name: []const u8) ?Tensor {
 pub fn toF32(st: *const SafeTensors, gpa: Allocator, tensor: Tensor) ![]f32 {
     const result = try gpa.alloc(f32, tensor.len());
     errdefer gpa.free(result);
+    const bytes = std.mem.sliceAsBytes(result);
+    const raw = bytes[bytes.len - (tensor.end - tensor.start) ..];
     switch (st.source) {
-        .bytes => |data| convert(tensor.dtype, data[tensor.start..tensor.end], result),
+        .bytes => |data| @memcpy(raw, data[tensor.start..tensor.end]),
         .file => |source| {
-            // Read in small chunks, because wasmtime rejects very large reads.
-            var buffer: [64 * 1024]u8 = undefined;
-            const size = tensor.dtype.byteSize();
+            // wasmtime rejects reads of a few hundred megabytes.
             var done: usize = 0;
-            while (done < result.len) {
-                const count = @min(buffer.len / size, result.len - done);
-                const chunk = buffer[0 .. count * size];
-                const offset = source.offset + tensor.start + done * size;
-                if (try source.file.readPositionalAll(source.io, chunk, offset) != chunk.len) return error.EndOfStream;
-                convert(tensor.dtype, chunk, result[done..][0..count]);
-                done += count;
+            while (done < raw.len) {
+                const chunk = raw[done..][0..@min(16 * 1024 * 1024, raw.len - done)];
+                if (try source.file.readPositionalAll(source.io, chunk, source.offset + tensor.start + done) != chunk.len) {
+                    return error.EndOfStream;
+                }
+                done += chunk.len;
             }
         },
     }
+    widen(tensor.dtype, result);
     return result;
 }
 
@@ -196,21 +198,51 @@ fn unsigned(value: std.json.Value) !usize {
     return std.math.cast(usize, value.integer) orelse error.InvalidInteger;
 }
 
-fn convert(dtype: DType, bytes: []const u8, out: []f32) void {
+/// Turns the raw little-endian values stored at the end of `values` into floats, in place.
+/// Working from the front is safe, because each step only writes over values it has already read.
+fn widen(dtype: DType, values: []f32) void {
+    const bytes = std.mem.sliceAsBytes(values);
+    const raw = bytes[bytes.len - values.len * dtype.byteSize() ..];
     switch (dtype) {
-        inline else => |t| for (out, 0..) |*value, i| {
-            value.* = read(t, bytes, i);
+        .F32 => if (native_endian == .big) std.mem.byteSwapAllElements(u32, @ptrCast(values)),
+        inline .BF16, .F16 => |t| {
+            const lanes = 8;
+            var i: usize = 0;
+            while (i + lanes <= values.len) : (i += lanes) {
+                const halves = std.mem.littleToNative(@Vector(lanes, u16), @bitCast(raw[2 * i ..][0 .. 2 * lanes].*));
+                values[i..][0..lanes].* = widenHalves(t, lanes, halves);
+            }
+            for (values[i..], i..) |*value, j| {
+                value.* = widenHalves(t, 1, .{std.mem.readInt(u16, raw[2 * j ..][0..2], .little)})[0];
+            }
         },
     }
 }
 
-fn read(comptime dtype: DType, bytes: []const u8, index: usize) f32 {
-    const start = index * comptime dtype.byteSize();
-    return switch (dtype) {
-        .F32 => @bitCast(std.mem.readInt(u32, bytes[start..][0..4], .little)),
-        .BF16 => @bitCast(@as(u32, std.mem.readInt(u16, bytes[start..][0..2], .little)) << 16),
-        .F16 => @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, bytes[start..][0..2], .little)))),
-    };
+fn widenHalves(comptime dtype: DType, comptime lanes: usize, halves: @Vector(lanes, u16)) @Vector(lanes, f32) {
+    if (dtype == .BF16) return @bitCast(@as(@Vector(lanes, u32), halves) << @splat(16));
+    return halfToSingle(lanes, halves);
+}
+
+/// Only AArch64 is sure to convert half floats with a single instruction.
+/// Elsewhere, `@floatCast` from `f16` can call a function for every value.
+const native_half = builtin.cpu.arch.isAARCH64();
+
+fn halfToSingle(comptime lanes: usize, half: @Vector(lanes, u16)) @Vector(lanes, f32) {
+    if (native_half) return @floatCast(@as(@Vector(lanes, f16), @bitCast(half)));
+    return widenHalfBits(lanes, half);
+}
+
+/// Widens half floats exactly, with integer and single-precision operations only.
+fn widenHalfBits(comptime lanes: usize, half: @Vector(lanes, u16)) @Vector(lanes, f32) {
+    const U = @Vector(lanes, u32);
+    const F = @Vector(lanes, f32);
+    const bits: U = half;
+    // Multiplying by 2^112 fixes the exponent bias, and turns subnormals into normal numbers.
+    const magnitude = @as(F, @bitCast((bits & @as(U, @splat(0x7fff))) << @splat(13))) * @as(F, @splat(0x1p112));
+    const infinite_or_nan = magnitude >= @as(F, @splat(0x1p16));
+    const widened = @select(u32, infinite_or_nan, @as(U, @bitCast(magnitude)) | @as(U, @splat(0x7f80_0000)), @as(U, @bitCast(magnitude)));
+    return @bitCast(widened | (bits & @as(U, @splat(0x8000))) << @splat(16));
 }
 
 fn fixture(gpa: Allocator, header: []const u8, data: []const u8) ![]u8 {
@@ -329,5 +361,20 @@ test "reject duplicate names, invalid metadata and unsupported storage types" {
         const bytes = try fixture(testing.allocator, case[0], &.{});
         defer testing.allocator.free(bytes);
         try testing.expectError(case[1], init(testing.allocator, bytes));
+    }
+}
+
+test "half floats widen exactly" {
+    var half: u16 = 0;
+    while (true) : (half += 1) {
+        const want: f32 = @floatCast(@as(f16, @bitCast(half)));
+        for ([_]f32{ halfToSingle(1, .{half})[0], widenHalfBits(1, .{half})[0] }) |got| {
+            if (std.math.isNan(want)) {
+                try testing.expect(std.math.isNan(got));
+            } else {
+                try testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(got)));
+            }
+        }
+        if (half == std.math.maxInt(u16)) break;
     }
 }

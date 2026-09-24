@@ -5,18 +5,19 @@ const Blas = enum { none, system, openblas };
 pub fn build(b: *std.Build) !void {
     var query = b.standardTargetOptionsQueryOnly(.{});
     // Enable SIMD on WebAssembly unless -Dcpu is given.
-    // Every current runtime supports it.
+    // wasmtime, wasmer, and Node support both, and relaxed SIMD adds a fused multiply-add.
     if (query.cpu_arch) |arch| {
         if (arch.isWasm() and query.cpu_model == .determined_by_arch_os) {
             query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.simd128));
+            query.cpu_features_add.addFeature(@backingInt(std.Target.wasm.Feature.relaxed_simd));
         }
     }
     const target = b.resolveTargetQuery(query);
     const optimize = b.standardOptimizeOption(.{});
 
+    // The Zig kernels are faster than OpenBLAS, so only Accelerate is used by default.
     const default_blas: Blas = switch (target.result.os.tag) {
         .macos => .system,
-        .wasi => .openblas,
         else => .none,
     };
     const blas = b.option(Blas, "blas", "BLAS backend: system, openblas (built from source, WASI only) or none") orelse default_blas;
