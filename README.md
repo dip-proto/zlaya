@@ -21,7 +21,7 @@ zig-out/bin/zlaya models/laya examples/triage.json
 ```
 
 The weights take about 804 MiB on disk and are expanded to float32 in memory.
-Allow several GiB of RAM for loading and inference.
+Loading and inference take about 1.7 GiB of RAM.
 After downloading the files, inference requires no network access.
 
 ## Requests and answers
@@ -141,7 +141,7 @@ Browsers would need a WASI shim that provides file access, but `wasm32-freestand
 On every target, the checkpoint is read tensor by tensor into a single float32 buffer, without ever holding the whole file.
 
 WebAssembly depends on this: wasm32 can address only 4 GiB, and its allocator rounds large blocks up to powers of two.
-The WebAssembly memory reaches about 2.1 GiB after loading, and 2.8 GiB with a full 512-token prompt.
+The WebAssembly memory reaches about 2.1 GiB after loading, and 2.7 GiB with a full 512-token prompt.
 
 ## Zig API
 
