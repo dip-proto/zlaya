@@ -123,10 +123,7 @@ fn render(arena: Allocator, question: Value) !Rendered {
     switch (qtype) {
         .choice => switch (criteria) {
             .object => |descriptions| {
-                var it = descriptions.iterator();
-                while (it.next()) |entry| {
-                    const label = entry.key_ptr.*;
-                    const description = entry.value_ptr.*;
+                for (descriptions.keys(), descriptions.values()) |label, description| {
                     try labels.append(arena, label);
                     if (isEmpty(description)) {
                         try options.append(arena, label);
@@ -306,6 +303,26 @@ test "structured criteria rendering and noul label order" {
     try testing.expectEqualStrings("yes: {\"value\": true}", rendered.options[1]);
     try testing.expectEqualStrings("no", rendered.labels[0]);
     try testing.expectEqualStrings("yes", rendered.labels[1]);
+}
+
+test "choice objects preserve label order and render empty and structured descriptions" {
+    var arena_instance: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const question = try std.json.parseFromSliceLeaky(Value, arena,
+        \\{"type":"choice","instructions":"pick","criteria":{"z":null,"a":"","m":{"value":true}}}
+    , .{});
+
+    const rendered = try render(arena, question);
+    const labels = [_][]const u8{ "z", "a", "m" };
+    const options = [_][]const u8{ "z", "a", "m: {\"value\": true}" };
+    try testing.expectEqual(labels.len, rendered.labels.len);
+    try testing.expectEqual(options.len, rendered.options.len);
+    for (labels, options, rendered.labels, rendered.options, question.object.get("criteria").?.object.keys()) |label, option, got_label, got_option, key| {
+        try testing.expectEqualStrings(label, got_label);
+        try testing.expectEqualStrings(option, got_option);
+        try testing.expect(got_label.ptr == key.ptr);
+    }
 }
 
 test "choice list deduplicates and invalid questions are rejected" {

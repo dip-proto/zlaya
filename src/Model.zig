@@ -383,7 +383,6 @@ pub fn forward(
     model.act_in.run(pool, features, &act_hidden, .replace);
     kernels.gelu(&act_hidden);
     const act_logits = try gpa.alloc(f32, model.act_out.outputs);
-    errdefer gpa.free(act_logits);
     model.act_out.run(pool, &act_hidden, act_logits, .replace);
 
     return .{ .logits = logits, .act_logits = act_logits };
