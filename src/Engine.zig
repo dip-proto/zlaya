@@ -246,8 +246,8 @@ fn rounded(value: f32) Value {
 }
 
 fn numericArray(arena: Allocator, values: anytype) !Value {
-    var array: std.json.Array = .init(arena);
-    try array.ensureTotalCapacity(values.len);
+    var array: std.json.Array = .empty;
+    try array.ensureTotalCapacity(arena, values.len);
     for (values) |value| array.appendAssumeCapacity(switch (@typeInfo(@TypeOf(value))) {
         .float => .{ .float = value },
         .int => .{ .integer = @intCast(value) },

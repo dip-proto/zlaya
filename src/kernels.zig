@@ -632,9 +632,9 @@ const Gemm = struct {
     /// Runs one of the blocks counted by `blocks(first_panel)`.
     fn runBlockFrom(gemm: *const Gemm, first_panel: usize, block: usize) void {
         const row_blocks = gemm.rowBlocks();
-        const first_row = block % row_blocks * block_rows;
+        const first_row = (block % row_blocks) * block_rows;
         const last_row = @min(first_row + block_rows, gemm.rows);
-        const first_tile = first_panel * tiles_per_panel + block / row_blocks * block_tiles;
+        const first_tile = first_panel * tiles_per_panel + (block / row_blocks) * block_tiles;
         const end_tile = gemm.panels() * tiles_per_panel;
         if (first_tile >= end_tile) return gemm.remainder(first_row, last_row);
         for (first_tile..@min(first_tile + block_tiles, end_tile)) |t| {

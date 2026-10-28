@@ -246,7 +246,7 @@ fn widenHalfBits(comptime lanes: usize, half: @Vector(lanes, u16)) @Vector(lanes
     const magnitude: U = @bitCast(scaled);
     const infinite_or_nan = scaled >= @as(F, @splat(0x1p16));
     const widened = @select(u32, infinite_or_nan, magnitude | @as(U, @splat(0x7f80_0000)), magnitude);
-    return @bitCast(widened | (bits & @as(U, @splat(0x8000))) << @splat(16));
+    return @bitCast(widened | ((bits & @as(U, @splat(0x8000))) << @splat(16)));
 }
 
 fn fixture(gpa: Allocator, header: []const u8, data: []const u8) ![]u8 {
